@@ -1,6 +1,6 @@
 # --- Define Source and Destination Groups ---
-$SourceGroupEmail = "sales@securonix.com"
-$DestinationGroupEmail = "SalesTeam@securonix.com"
+$SourceGroupEmail = ""
+$DestinationGroupEmail = ""
 
 # --- Get Members from the Source Group ---
 Write-Host "Attempting to retrieve members from '$SourceGroupEmail'..." -ForegroundColor Cyan
