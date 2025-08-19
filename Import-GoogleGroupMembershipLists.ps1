@@ -2,59 +2,53 @@
 
 <#
 .SYNOPSIS
-Imports group memberships and ownership into various Microsoft 365 group types (M365 Groups, DLs, MESGs)
-from a CSV where each row defines a group and its members/managers/owners in specific columns.
+Imports group memberships and ownership from a CSV into various Microsoft 365 groups.
 
 .DESCRIPTION
-Reads a CSV file (list format: one row per group). Determines the target group type in M365 (M365 Group, DL, MESG).
-- For M365 Groups: Adds Google Members as Members, Google Managers/Owners as Owners.
-- For DLs/MESGs: Adds ALL Google Members/Managers/Owners as Members. (See NOTES).
-Handles identity/group mapping via customizable functions (simplified based on prior user input).
+Reads a CSV file where each row defines a group and its members/managers/owners. The script determines the target group's
+type in Microsoft 365 (M365 Group, Distribution List, or Mail-Enabled Security Group) and adds users accordingly.
+- For M365 Groups: Adds members and owners based on separate CSV columns.
+- For DLs/MESGs: Adds all specified users (members, managers, owners) as standard members.
 
 .PARAMETER CsvPath
-The full path to the input CSV file (list format).
+The full path to the input CSV file.
 
 .PARAMETER CsvHeaderGroupEmail
-The header name in the CSV for the column containing the group's email address. Defaults to "email".
+The CSV header for the group's email address.
 
 .PARAMETER CsvHeaderManagers
-The header name in the CSV for the column containing the space-separated list of manager emails. Defaults to "Managers".
+The CSV header for the space-separated list of manager emails.
 
 .PARAMETER CsvHeaderMembers
-The header name in the CSV for the column containing the space-separated list of member emails. Defaults to "Members".
+The CSV header for the space-separated list of member emails.
 
 .PARAMETER CsvHeaderOwners
-The header name in the CSV for the column containing the space-separated list of owner emails. Defaults to "Owners".
+The CSV header for the space-separated list of owner emails.
 
 .PARAMETER WhatIf
-Shows what actions would be taken without actually making changes.
+Shows what actions would be taken without making changes.
 
 .PARAMETER Confirm
 Prompts for confirmation before performing actions that modify groups.
 
 .EXAMPLE
-# Run against a CSV, handling mixed group types, using default headers
-.\Import-GoogleGroupMembershipLists-MultiType.ps1 -CsvPath "C:\temp\groups_list_format.csv" -Verbose
+.\Import-M365GroupMemberships.ps1 -CsvPath "C:\temp\groups.csv" -Verbose
 
 .EXAMPLE
 # Run in WhatIf mode with custom headers
-.\Import-GoogleGroupMembershipLists-MultiType.ps1 -CsvPath "C:\Users\Adrian\Downloads\groups.csv" -CsvHeaderGroupEmail "GroupAddress" -CsvHeaderManagers "MgrList" -WhatIf
+.\Import-M365GroupMemberships.ps1 -CsvPath "C:\data\groups.csv" -CsvHeaderGroupEmail "GroupAddress" -CsvHeaderManagers "MgrList" -WhatIf
 
 .NOTES
-- Assumes Group emails and User emails/UPNs are IDENTICAL between Google and M365, based on prior user confirmation. Functions reflect this.
-- For Distribution Lists (DLs) and Mail-Enabled Security Groups (MESGs), Google Managers/Owners are added as MEMBERS, not owners/managers in M365, as the concepts differ. The 'ManagedBy' property is NOT modified by this script.
-- Ensure you are connected to Exchange Online (`Connect-ExchangeOnline`).
-- Requires appropriate permissions (e.g., Global Admin, Exchange Admin, Groups Admin) in Microsoft 365.
-- Target Microsoft 365 groups/lists must exist beforehand.
+- Assumes group and user email addresses are identical between the source (e.g., Google) and Microsoft 365.
+- For DLs and MESGs, source 'Managers' and 'Owners' are added as MEMBERS. The 'ManagedBy' property is not modified.
+- You must be connected to Exchange Online via `Connect-ExchangeOnline`.
+- Requires appropriate permissions (e.g., Exchange Administrator, Groups Administrator).
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [Parameter(Mandatory = $true)]
+    [ValidateScript({ Test-Path -Path $_ -PathType Leaf })]
     [string]$CsvPath,
-
-    # Note: $GoogleDomain / $M365Domain are removed as parameters as the conversion functions
-    # below are simplified based on prior confirmation of identical emails/UPNs.
-    # If that assumption changes, re-add parameters and revert function logic.
 
     [Parameter(Mandatory = $false)]
     [string]$CsvHeaderGroupEmail = "email",
@@ -69,183 +63,195 @@ param(
     [string]$CsvHeaderOwners = "Owners"
 )
 
-# --- Function Definitions (Simplified based on prior user confirmation) ---
+# --- Helper Functions ---
 
-function Convert-GoogleEmailToM365UPN {
+function Get-UpnsFromCsvColumn {
     param(
-        [string]$GoogleEmail
+        [string]$EmailString
     )
-    # Simplified: Assumes Google User Email == M365 UPN
-    if ($GoogleEmail -like '*@*') {
-        return $GoogleEmail.Trim()
-    } else {
-        Write-Warning "Input '$GoogleEmail' provided for user conversion does not appear to be a valid email format."
-        return $null
+    # This helper function parses a space-separated string of emails,
+    # validates each one, and returns a unique, non-empty array of UPNs.
+    $upnSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not [string]::IsNullOrWhiteSpace($EmailString)) {
+        foreach ($email in $EmailString.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)) {
+            $trimmedEmail = $email.Trim()
+            if ($trimmedEmail -like '*@*') {
+                $upnSet.Add($trimmedEmail) | Out-Null
+            }
+            else {
+                Write-Warning "Skipping invalid user email format: '$trimmedEmail'"
+            }
+        }
     }
+    return [string[]]$upnSet
 }
 
-function Get-TargetM365GroupEmail {
-    param(
-        [string]$GoogleGroupEmail
-    )
-    # Simplified: Assumes Google Group Email == M365 Group Email
-     if ($GoogleGroupEmail -like '*@*') {
-        return $GoogleGroupEmail.Trim()
-    } else {
-        Write-Warning "Input '$GoogleGroupEmail' does not look like a valid email address for group identification."
-        return $null
-    }
-}
-
-
-# --- Main Script Logic ---
+# --- Script Initialization ---
 
 # Check connection
-try { Get-ConnectionInformation | Out-Null; Write-Verbose "Connection verified." } catch { Write-Error "Not connected. Run Connect-ExchangeOnline."; return }
-
-# Validate CSV Path
-if (-not (Test-Path -Path $CsvPath -PathType Leaf)) { Write-Error "CSV not found: $CsvPath"; return }
+try {
+    Get-ConnectionInformation | Out-Null
+    Write-Verbose "Exchange Online connection verified."
+}
+catch {
+    Write-Error "Not connected to Exchange Online. Please run Connect-ExchangeOnline and try again."
+    return
+}
 
 # Import CSV
-try { $importData = Import-Csv -Path $CsvPath } catch { Write-Error "Failed import: $CsvPath. Error: $($_.Exception.Message)"; return }
-if ($null -eq $importData -or $importData.Count -eq 0) { Write-Warning "CSV '$CsvPath' empty/unreadable."; return }
+try {
+    $importData = Import-Csv -Path $CsvPath
+    if ($null -eq $importData) { throw }
+    Write-Verbose "Successfully imported $($importData.Count) rows from '$CsvPath'."
+}
+catch {
+    Write-Error "Failed to import or read CSV file at '$CsvPath'. Error: $($_.Exception.Message)"
+    return
+}
 
 # Verify headers
 $requiredHeaders = @($CsvHeaderGroupEmail, $CsvHeaderManagers, $CsvHeaderMembers, $CsvHeaderOwners)
 $actualHeaders = $importData[0].PSObject.Properties.Name
 $missingHeaders = $requiredHeaders | Where-Object { $actualHeaders -notcontains $_ }
-if ($missingHeaders.Count -gt 0) { Write-Error "CSV missing header(s): '$($missingHeaders -join "', '")'. Check CSV or parameters."; return }
+if ($missingHeaders.Count -gt 0) {
+    Write-Error "CSV is missing required header(s): '$($missingHeaders -join "', '")'. Please check the CSV file or the -CsvHeader* parameters."
+    return
+}
 Write-Verbose "CSV headers verified."
 
-Write-Host "Starting processing of $($importData.Count) groups from CSV."
+# --- Main Processing Loop ---
 
-# Process each row (group)
+$totalRows = $importData.Count
+$processedCount = 0
+$summary = @{
+    TotalRows = $totalRows
+    GroupsProcessed = 0
+    GroupsSkipped = 0
+    MembershipErrors = 0
+}
+
+Write-Host "Starting group membership processing for $totalRows groups."
+
 foreach ($row in $importData) {
+    $processedCount++
     $googleGroupEmail = $row.$($CsvHeaderGroupEmail).Trim()
 
-    Write-Host ("-"*40)
-    Write-Host "Processing Group Row for: $googleGroupEmail"
+    Write-Progress -Activity "Processing Groups from CSV" -Status "Group $processedCount of ${totalRows}: $googleGroupEmail" -PercentComplete (($processedCount / $totalRows) * 100)
 
-    if ([string]::IsNullOrWhiteSpace($googleGroupEmail)){ Write-Warning "Skipping row (index $($importData.IndexOf($row))) due to empty Group Email ('$CsvHeaderGroupEmail')."; continue }
+    Write-Host ("-" * 50)
+    Write-Host "Processing Row ${processedCount}: $googleGroupEmail"
 
-    # 1. Determine Target M365 Email (Simplified)
-    $m365TargetEmail = Get-TargetM365GroupEmail -GoogleGroupEmail $googleGroupEmail
-    if (-not $m365TargetEmail) { Write-Warning "Skipping group '$googleGroupEmail' - could not determine target M365 email."; continue }
-    Write-Verbose "Target M365 Email/Identity: $m365TargetEmail"
+    if ([string]::IsNullOrWhiteSpace($googleGroupEmail)) {
+        Write-Warning "Skipping row $processedCount because the group email is empty."
+        $summary.GroupsSkipped++
+        continue
+    }
 
-    # 2. Identify Target Recipient Type in M365
-    $targetRecipient = $null
+    # 1. Identify Target Recipient
     try {
-        $targetRecipient = Get-Recipient -Identity $m365TargetEmail -ErrorAction Stop
-        Write-Verbose "Found target recipient '$m365TargetEmail'. Type: $($targetRecipient.RecipientTypeDetails)."
+        $targetRecipient = Get-Recipient -Identity $googleGroupEmail -ErrorAction Stop
+        Write-Verbose "Found target '$googleGroupEmail' with type '$($targetRecipient.RecipientTypeDetails)'."
     }
-    catch [System.Management.Automation.ItemNotFoundException] { Write-Warning "Target '$m365TargetEmail' not found in Microsoft 365. Skipping."; continue }
-    catch { Write-Warning "Error accessing target '$m365TargetEmail'. Skipping. Error: $($_.Exception.Message)"; continue }
-
-    # 3. Prepare lists of potential members and owners from CSV row
-    $potentialOwners = [System.Collections.Generic.List[string]]::new()
-    $potentialMembers = [System.Collections.Generic.List[string]]::new()
-    $processedOwnerUPNs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $processedMemberUPNs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-    # Parse Owners/Managers from CSV -> potentialOwners list
-    $managerString = $row.$($CsvHeaderManagers); $ownerString = $row.$($CsvHeaderOwners)
-    $ownerManagerEmailsFromCsv = @()
-    if (-not [string]::IsNullOrWhiteSpace($managerString)) { $ownerManagerEmailsFromCsv += $managerString.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries) }
-    if (-not [string]::IsNullOrWhiteSpace($ownerString)) { $ownerManagerEmailsFromCsv += $ownerString.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries) }
-
-    foreach ($ggEmail in $ownerManagerEmailsFromCsv) {
-         $m365UPN = Convert-GoogleEmailToM365UPN -GoogleEmail $ggEmail
-         if ($m365UPN -and $processedOwnerUPNs.Add($m365UPN)) { $potentialOwners.Add($m365UPN) }
-         # Warnings for failed mapping handled in function
+    catch {
+        Write-Warning "Could not find or access '$googleGroupEmail' in Microsoft 365. Skipping. Error: $($_.Exception.Message)"
+        $summary.GroupsSkipped++
+        continue
     }
-    Write-Verbose "Prepared $($potentialOwners.Count) potential owner UPNs."
 
-    # Parse Members from CSV -> potentialMembers list
-    $memberString = $row.$($CsvHeaderMembers); $memberEmailsFromCsv = @()
-    if (-not [string]::IsNullOrWhiteSpace($memberString)) { $memberEmailsFromCsv = $memberString.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries) }
+    # 2. Prepare Member and Owner UPN lists using the helper function
+    $ownersToAdd = Get-UpnsFromCsvColumn -EmailString ($row.$($CsvHeaderManagers) + " " + $row.$($CsvHeaderOwners))
+    $membersToAdd = Get-UpnsFromCsvColumn -EmailString $row.$($CsvHeaderMembers)
+    Write-Verbose "Found $($ownersToAdd.Count) potential owners and $($membersToAdd.Count) potential members in CSV row."
 
-    foreach ($ggEmail in $memberEmailsFromCsv) {
-         $m365UPN = Convert-GoogleEmailToM365UPN -GoogleEmail $ggEmail
-         if ($m365UPN -and $processedMemberUPNs.Add($m365UPN)) { $potentialMembers.Add($m365UPN) }
-         # Warnings for failed mapping handled in function
-    }
-    Write-Verbose "Prepared $($potentialMembers.Count) potential member UPNs."
+    $summary.GroupsProcessed++
 
-    # 4. Process based on Target Recipient Type
-    switch ($targetRecipient.RecipientTypeDetails) {
+    # 3. Process based on Target Recipient Type
+    switch -Wildcard ($targetRecipient.RecipientTypeDetails) {
         # --- Microsoft 365 Group ---
         "GroupMailbox" {
-            Write-Host "Target is a Microsoft 365 Group. Processing Owners and Members separately."
+            Write-Host "Target is a Microsoft 365 Group. Processing owners and members."
 
-            # Optimize: Remove members who are also owners
-            $membersToAddOptimized = $potentialMembers | Where-Object { -not $processedOwnerUPNs.Contains($_) }
-            $removedCount = $potentialMembers.Count - $membersToAddOptimized.Count
-            if ($removedCount -gt 0) { Write-Verbose "Optimization: Removed $removedCount member(s) already queued as owners."}
+            # Optimize: Remove any users from the member list who are already designated as owners.
+            $ownerSet = [System.Collections.Generic.HashSet[string]]::new($ownersToAdd, [System.StringComparer]::OrdinalIgnoreCase)
+            $membersOnly = $membersToAdd | Where-Object { -not $ownerSet.Contains($_) }
+            if ($membersToAdd.Count -ne $membersOnly.Count) {
+                Write-Verbose "Optimization: $($membersToAdd.Count - $membersOnly.Count) user(s) removed from member list as they are already being added as owners."
+            }
 
             # Add Owners
-            if ($potentialOwners.Count -gt 0) {
-                Write-Host "Attempting to add $($potentialOwners.Count) owner(s)..."
-                if ($PSCmdlet.ShouldProcess($m365TargetEmail, "Add Owners (UnifiedGroupLinks): $($potentialOwners -join ', ')")) {
-                    try { Add-UnifiedGroupLinks -Identity $m365TargetEmail -LinkType Owners -Links $potentialOwners -ErrorAction Stop; Write-Host "Owner add success."} catch { Write-Warning "Owner add failed for '$m365TargetEmail'. Error: $($_.Exception.Message)" }
-                }
-            } else { Write-Verbose "No new owners to add." }
-
-            # Add Members (Optimized List)
-            if ($membersToAddOptimized.Count -gt 0) {
-                Write-Host "Attempting to add $($membersToAddOptimized.Count) member(s)..."
-                if ($PSCmdlet.ShouldProcess($m365TargetEmail, "Add Members (UnifiedGroupLinks): $($membersToAddOptimized -join ', ')")) {
-                    try { Add-UnifiedGroupLinks -Identity $m365TargetEmail -LinkType Members -Links $membersToAddOptimized -ErrorAction Stop; Write-Host "Member add success." } catch { Write-Warning "Member add failed for '$m365TargetEmail'. Error: $($_.Exception.Message)" }
-                }
-            } else { Write-Verbose "No new members (excluding owners) to add." }
-        }
-
-        # --- Distribution List ---
-        "MailUniversalDistributionGroup" { Write-Warning "Target '$m365TargetEmail' is a Distribution List. Google Owners/Managers will be added as Members."; $isDLOrMESG = $true }
-        "MailNonUniversalDistributionGroup" { Write-Warning "Target '$m365TargetEmail' is a Distribution List. Google Owners/Managers will be added as Members."; $isDLOrMESG = $true }
-
-        # --- Mail-Enabled Security Group ---
-        "MailUniversalSecurityGroup" { Write-Warning "Target '$m365TargetEmail' is a Mail-Enabled Security Group. Google Owners/Managers will be added as Members."; $isDLOrMESG = $true }
-
-        # --- Default Case ---
-        default {
-            Write-Warning "Target '$m365TargetEmail' is of type '$($targetRecipient.RecipientTypeDetails)', which is not handled by this script's membership logic. Skipping additions."
-            $isDLOrMESG = $false # Ensure DL/MESG logic doesn't run
-        }
-    } # End Switch
-
-    # --- Logic for DLs and MESGs (if $isDLOrMESG was set to $true) ---
-    if ($isDLOrMESG) {
-        # Combine all potential owners and members into one list for DLs/MESGs
-        $allMembersToAddSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $potentialOwners | ForEach-Object { $allMembersToAddSet.Add($_) | Out-Null }
-        $potentialMembers | ForEach-Object { $allMembersToAddSet.Add($_) | Out-Null }
-        $allMembersToAddList = [System.Collections.Generic.List[string]]($allMembersToAddSet)
-
-        if ($allMembersToAddList.Count -gt 0) {
-            Write-Host "Attempting to add $($allMembersToAddList.Count) members (incl. Google Owners/Mgrs) to DL/MESG '$m365TargetEmail'..."
-            if ($PSCmdlet.ShouldProcess($m365TargetEmail, "Add Members (DistributionGroupMember): $($allMembersToAddList -join ', ')")) {
-                # Add-DistributionGroupMember adds one member at a time, need to loop
-                $failedMembers = [System.Collections.Generic.List[string]]::new()
-                foreach ($memberUPN in $allMembersToAddList) {
+            if ($ownersToAdd.Count -gt 0) {
+                if ($PSCmdlet.ShouldProcess($googleGroupEmail, "Add $($ownersToAdd.Count) Owner(s)")) {
                     try {
-                        Add-DistributionGroupMember -Identity $m365TargetEmail -Member $memberUPN -BypassSecurityGroupManagerCheck -ErrorAction Stop
-                        Write-Verbose "  Successfully added member $memberUPN"
-                    } catch {
-                        Write-Warning "  Failed to add member '$memberUPN' to '$m365TargetEmail'. Error: $($_.Exception.Message)"
-                        $failedMembers.Add($memberUPN)
+                        Add-UnifiedGroupLinks -Identity $googleGroupEmail -LinkType Owners -Links $ownersToAdd -ErrorAction Stop
+                        Write-Host "Successfully added $($ownersToAdd.Count) owner(s)."
+                    }
+                    catch {
+                        Write-Warning "Failed to add owners to '$googleGroupEmail'. Error: $($_.Exception.Message)"
+                        $summary.MembershipErrors++
                     }
                 }
-                if ($failedMembers.Count -eq 0) { Write-Host "Finished adding members to DL/MESG." }
-                else { Write-Warning "Finished adding members to DL/MESG, but $($failedMembers.Count) addition(s) failed."}
             }
-        } else {
-            Write-Verbose "No new members identified/mapped to add to DL/MESG '$m365TargetEmail'."
-        }
-        $isDLOrMESG = $false # Reset flag for next loop iteration
-    }
 
+            # Add Members
+            if ($membersOnly.Count -gt 0) {
+                if ($PSCmdlet.ShouldProcess($googleGroupEmail, "Add $($membersOnly.Count) Member(s)")) {
+                    try {
+                        Add-UnifiedGroupLinks -Identity $googleGroupEmail -LinkType Members -Links $membersOnly -ErrorAction Stop
+                        Write-Host "Successfully added $($membersOnly.Count) member(s)."
+                    }
+                    catch {
+                        Write-Warning "Failed to add members to '$googleGroupEmail'. Error: $($_.Exception.Message)"
+                        $summary.MembershipErrors++
+                    }
+                }
+            }
+        }
+
+        # --- Distribution List or Mail-Enabled Security Group ---
+        "*DistributionGroup" {
+            Write-Warning "Target '$googleGroupEmail' is a DL or MESG. All users from CSV (Owners, Managers, Members) will be added as Members."
+
+            # Combine all users into a single, unique list.
+            $allUsersSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $ownersToAdd | ForEach-Object { $allUsersSet.Add($_) | Out-Null }
+            $membersToAdd | ForEach-Object { $allUsersSet.Add($_) | Out-Null }
+            $allMembersToAdd = [string[]]$allUsersSet
+
+            if ($allMembersToAdd.Count -eq 0) {
+                Write-Verbose "No new members to add."
+                continue
+            }
+            
+            Write-Host "Attempting to add $($allMembersToAdd.Count) member(s) to '$googleGroupEmail'."
+            if ($PSCmdlet.ShouldProcess($googleGroupEmail, "Add $($allMembersToAdd.Count) Member(s) individually")) {
+                foreach ($member in $allMembersToAdd) {
+                    try {
+                        Add-DistributionGroupMember -Identity $googleGroupEmail -Member $member -BypassSecurityGroupManagerCheck -ErrorAction Stop
+                        Write-Verbose " -> Successfully added member: $member"
+                    }
+                    catch {
+                        Write-Warning " -> Failed to add member '$member'. Error: $($_.Exception.Message)"
+                        $summary.MembershipErrors++
+                    }
+                }
+            }
+        }
+
+        # --- Default Case for unhandled types ---
+        default {
+            Write-Warning "Target '$googleGroupEmail' is a '$($targetRecipient.RecipientTypeDetails)', which is not supported by this script. Skipping."
+            $summary.GroupsSkipped++
+            $summary.GroupsProcessed-- # Decrement since we didn't actually process it
+        }
+    } # End Switch
 } # End foreach row
 
-Write-Host ("-"*40)
-Write-Host "Script finished."
+# --- Final Summary ---
+Write-Progress -Activity "Processing Groups from CSV" -Completed
+Write-Host ("=" * 50)
+Write-Host "Script Finished. Summary:"
+Write-Host " - Total Rows in CSV:      $($summary.TotalRows)"
+Write-Host " - Groups Processed:         $($summary.GroupsProcessed)"
+Write-Host " - Groups Skipped:           $($summary.GroupsSkipped) (Not found, empty email, or unsupported type)"
+Write-Host " - Membership Add Failures:  $($summary.MembershipErrors) (See warnings above for details)"
+Write-Host ("=" * 50)
