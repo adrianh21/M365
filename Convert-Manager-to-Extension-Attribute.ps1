@@ -5,7 +5,8 @@
 .DESCRIPTION
     This script connects to Microsoft Graph to iterate through all member users (excluding guests) 
     in the tenant. For each user, it makes a specific call to find their manager. If a manager is found,
-    it updates the user's extensionAttribute2 with the manager's display name.
+    it updates the user's extensionAttribute2 with the manager's display name. The extension attribute being
+    modified can be adjusted by modifying the sections from line 92 to line 107.
 
 .NOTES
     Prerequisites:
